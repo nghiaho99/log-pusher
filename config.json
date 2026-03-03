@@ -1,0 +1,25 @@
+{
+  "api": {
+    "url": "https://logs.smartsign.com.vn/insert/jsonline",
+    "log_path": "/opt/jboss-5.1.0.GA/server/default/log/server.log",
+    "auth": {
+      "username": "logwriter",
+      "password": "i7MdMuBvSjPG7khgWSjEvFobrsstGy"
+    },
+    "headers": {
+      "Content-Type": "application/x-ndjson"
+    }
+  },
+  "sample_body": {
+    "_time": "1768451022",
+    "_msg": "Nghĩa test",
+    "username": "tms2",
+    "ip": "27.74.253.50",
+    "domain": "tms2.smartsign.com.vn",
+    "mirror": "0",
+    "action": "check update",
+    "status": "success",
+    "user_agent": "",
+    "location": ""
+  }
+}
