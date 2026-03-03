@@ -81,8 +81,8 @@ async function getTokenHid(tokenCode) {
     // 3. Query xuống Database
     try {
         const [rows] = await dbPool.execute(
-            'SELECT token_hid FROM token_ms WHERE tokenCode = ? LIMIT 1',
-            [tokenCode]
+            'SELECT token_hid FROM token_ms WHERE CAST(token_code AS CHAR) = ? LIMIT 1',
+            [tokenCode.toString().trim()]
         );
 
         if (rows.length > 0 && rows[0].token_hid) {
@@ -257,16 +257,29 @@ function removeBatchFromDisk(count) {
     );
 }
 
-// Sử dụng for await...of để đọc file log tuần tự, giúp tránh overload do query DB
-async function processStream(stream) {
-    const rl = readline.createInterface({
-        input: stream,
-        crlfDelay: Infinity
-    });
+// Sử dụng sự kiện 'line' với pause/resume để tương thích với các phiên bản Node.js cũ
+function processStream(stream) {
+    return new Promise((resolve, reject) => {
+        const rl = readline.createInterface({
+            input: stream,
+            crlfDelay: Infinity
+        });
 
-    for await (const line of rl) {
-        await processLine(line);
-    }
+        rl.on('line', async (line) => {
+            // Tạm dừng đọc dòng tiếp theo để chờ xử lý xong dòng hiện tại (bao gồm query DB)
+            rl.pause(); 
+            try {
+                await processLine(line);
+            } catch (err) {
+                console.error("Error processing line:", err);
+            } finally {
+                rl.resume(); // Tiếp tục đọc
+            }
+        });
+
+        rl.on('close', resolve);
+        rl.on('error', reject);
+    });
 }
 
 // Hàm chính
