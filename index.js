@@ -2,12 +2,14 @@ const fs = require('fs');
 const readline = require('readline');
 const axios = require('axios');
 const path = require('path');
+const mysql = require('mysql2/promise');
 
 // Đọc cấu hình từ file
 const config = require('./config.json');
 // Sử dụng đường dẫn log từ file cấu hình (CentOS)
 const LOG_FILE = config.api.log_path;
 const BUFFER_FILE = path.join(__dirname, 'log_buffer.ndjson');
+const CACHE_FILE = path.join(__dirname, 'token_cache.json');
 
 // CẤU HÌNH BATCHING
 const BATCH_SIZE = 50;
@@ -18,8 +20,90 @@ let logBuffer = [];
 let flushTimer = null;
 let isSending = false;       // Biến khóa để đảm bảo không gửi chồng chéo
 
+// Cache Token
+let tokenCache = {};
+let dbPool = null;
+
 // Regex phân tích dòng log
 const LOG_REGEX = /^(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2},\d{3})\s+(\w+)\s+.*IP:\[([^\]]+)\]\s+(.*)/;
+
+// ================= DATABASE & CACHE LOGIC =================
+
+function loadCache() {
+    if (fs.existsSync(CACHE_FILE)) {
+        try {
+            const data = fs.readFileSync(CACHE_FILE, 'utf8');
+            tokenCache = JSON.parse(data);
+            console.log(`[Cache] Loaded ${Object.keys(tokenCache).length} tokens from disk.`);
+        } catch (e) {
+            console.error('[Cache] Failed to load cache from disk:', e.message);
+        }
+    }
+}
+
+function saveCache() {
+    try {
+        fs.writeFileSync(CACHE_FILE, JSON.stringify(tokenCache, null, 2), 'utf8');
+    } catch (e) {
+        console.error('[Cache] Failed to save cache to disk:', e.message);
+    }
+}
+
+function initDatabase() {
+    if (config.database && config.database.host) {
+        dbPool = mysql.createPool({
+            host: config.database.host,
+            user: config.database.user,
+            password: config.database.password,
+            database: config.database.database,
+            port: config.database.port || 3306,
+            waitForConnections: true,
+            connectionLimit: 10,
+            queueLimit: 0
+        });
+        console.log(`[DB] MySQL pool initialized.`);
+    } else {
+        console.warn(`[DB] No database configuration found.`);
+    }
+}
+
+async function getTokenHid(tokenCode) {
+    if (!tokenCode) return tokenCode;
+    
+    // 1. Kiểm tra RAM Cache
+    if (tokenCache[tokenCode]) {
+        return tokenCache[tokenCode];
+    }
+
+    // 2. Nếu chưa có kết nối DB thì trả về gốc
+    if (!dbPool) return tokenCode;
+
+    // 3. Query xuống Database
+    try {
+        const [rows] = await dbPool.execute(
+            'SELECT token_hid FROM token_ms WHERE tokenCode = ? LIMIT 1',
+            [tokenCode]
+        );
+
+        if (rows.length > 0 && rows[0].token_hid) {
+            const tokenHid = rows[0].token_hid;
+            // Lưu vào Cache RAM và ghi ra ổ cứng
+            tokenCache[tokenCode] = tokenHid;
+            saveCache();
+            return tokenHid;
+        }
+    } catch (err) {
+        console.error(`[DB] Error querying tokenCode ${tokenCode}:`, err.message);
+    }
+
+    // Nếu không tìm thấy trong DB, lưu lại giá trị gốc để lần sau không query lại làm chậm DB
+    tokenCache[tokenCode] = tokenCode;
+    saveCache();
+    
+    return tokenCode;
+}
+
+// ================= LOG PROCESSING LOGIC =================
 
 function countDiskBuffer() {
     if (!fs.existsSync(BUFFER_FILE)) return 0;
@@ -52,27 +136,20 @@ async function flushLogs() {
         });
         
         // --- GỬI THÀNH CÔNG ---
-        // Bây giờ mới xóa số log đã gửi khỏi buffer
         removeBatchFromDisk(chunkToSend.length);
         
         const remaining = countDiskBuffer();
 		console.log(`[TMS2] Sent ${chunkToSend.length} logs successfully. Remaining buffer: ${remaining}`);
 
-        
-        // Nếu buffer vẫn còn nhiều (do tích tụ lâu), gọi gửi tiếp ngay lập tức không cần đợi 5s
-        if (logBuffer.length > 0) {
+        if (countDiskBuffer() > 0) {
             isSending = false;
-            setTimeout(flushLogs, 100); // Nghỉ 100ms rồi gửi tiếp luôn
+            setTimeout(flushLogs, 100); 
             return;
         }
 
     } catch (error) {
-        // --- GỬI THẤT BẠI ---
-        // Không làm gì cả, log vẫn nằm nguyên trong logBuffer.
-        // Lần sau hàm này chạy lại sẽ lấy đúng đám log này gửi lại.
-        
         const errorMsg = error.response ? `Status ${error.response.status}` : error.message;
-        console.error(`[RETRY] Connection failed (${errorMsg}). Keeping ${chunkToSend.length} logs in queue. Total buffered: ${logBuffer.length}`);
+        console.error(`[RETRY] Connection failed (${errorMsg}). Keeping logs in queue. Total buffered: ${countDiskBuffer()}`);
     } finally {
         isSending = false; // Mở khóa
     }
@@ -97,9 +174,8 @@ function appendToDisk(payload) {
     }
 }
 
-// Hàm parse và xử lý một dòng log
-function processLine(line) {
-    // ... (Phần logic parse giữ nguyên)
+// Hàm parse và xử lý một dòng log (Đã chuyển thành async)
+async function processLine(line) {
     if (!line || !line.trim()) return;
 
     const match = line.match(LOG_REGEX);
@@ -109,7 +185,6 @@ function processLine(line) {
 
     if (level.toUpperCase().trim() !== 'INFO') return;
 
-    // ... (Logic parse timestamp giữ nguyên)
     let timestamp = "0";
     try {
         const isoTime = rawTime.replace(',', '.').trim(); 
@@ -118,7 +193,6 @@ function processLine(line) {
         timestamp = Math.floor(Date.now() / 1000).toString();
     }
 
-    // Helper extract
     const extract = (key) => {
         const regex = new RegExp(`${key}=\\s*([^\\s]*)`);
         const m = content.match(regex);
@@ -129,7 +203,10 @@ function processLine(line) {
     if (!rawAction) return; 
 
     const action = rawAction.toLowerCase();
-    const username = extract('tokenCode');
+    const tokenCode = extract('tokenCode');
+
+    // QUERY DATABASE / CACHE LẤY token_hid
+    const username = await getTokenHid(tokenCode);
 
     let msg = content;
     const msgKey = "logCreatedByCertSn=";
@@ -143,7 +220,7 @@ function processLine(line) {
     const payload = {
         _time: timestamp.trim(),
         _msg: msg,
-        username: username,
+        username: username, // Sử dụng username đã được query DB hoặc lấy từ cache
         ip: ip.trim(),
         domain: "tms2.smartsign.com.vn",
         mirror: "0",
@@ -180,51 +257,50 @@ function removeBatchFromDisk(count) {
     );
 }
 
+// Sử dụng for await...of để đọc file log tuần tự, giúp tránh overload do query DB
+async function processStream(stream) {
+    const rl = readline.createInterface({
+        input: stream,
+        crlfDelay: Infinity
+    });
+
+    for await (const line of rl) {
+        await processLine(line);
+    }
+}
 
 // Hàm chính
 function main() {
     console.log(`Starting Log Shipper... Watching: ${LOG_FILE}`);
     console.log(`Target API: ${config.api.url}`);
     
+    loadCache();
+    initDatabase();
     startBatchTimer();
 
     // 1. Kiểm tra và đọc nội dung hiện có nếu file tồn tại
     if (fs.existsSync(LOG_FILE)) {
         console.log("Reading existing logs...");
         const initialStream = fs.createReadStream(LOG_FILE);
-        const initialRl = readline.createInterface({
-            input: initialStream,
-            crlfDelay: Infinity
-        });
-        initialRl.on('line', (line) => processLine(line));
+        // Chạy bất đồng bộ
+        processStream(initialStream).catch(e => console.error("Error processing initial log stream:", e));
     } else {
         console.warn(`File not found: ${LOG_FILE}. Waiting for file creation...`);
     }
 
     // 2. Theo dõi thay đổi (bao gồm cả Log Rotation)
-    // interval: 1000ms giúp giảm tải CPU trên CentOS cũ
     fs.watchFile(LOG_FILE, { interval: 1000 }, (curr, prev) => {
         if (curr.size > prev.size) {
-            // Trường hợp có log mới nối thêm vào
             const newStream = fs.createReadStream(LOG_FILE, {
                 start: prev.size,
                 end: curr.size
             });
-            const newRl = readline.createInterface({
-                input: newStream,
-                crlfDelay: Infinity
-            });
-            newRl.on('line', (line) => processLine(line));
+            processStream(newStream).catch(e => console.error("Error processing tail stream:", e));
         } 
         else if (curr.size < prev.size) {
-            // TRƯỜNG HỢP LOG ROTATION: File cũ được nén/đổi tên, file mới (nhỏ hơn) được tạo ra
             console.log("Log rotation detected (new file started). Reading from beginning.");
             const rotateStream = fs.createReadStream(LOG_FILE);
-            const rotateRl = readline.createInterface({
-                input: rotateStream,
-                crlfDelay: Infinity
-            });
-            rotateRl.on('line', (line) => processLine(line));
+            processStream(rotateStream).catch(e => console.error("Error processing rotated stream:", e));
         }
     });
 }

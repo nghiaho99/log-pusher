@@ -10,6 +10,13 @@
       "Content-Type": "application/x-ndjson"
     }
   },
+  "database": {
+    "host": "127.0.0.1",
+    "user": "root",
+    "password": "yourpassword",
+    "database": "tmsv2basic",
+    "port": 3306
+  },
   "sample_body": {
     "_time": "1768451022",
     "_msg": "Nghĩa test",
